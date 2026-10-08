@@ -287,6 +287,29 @@ void main() {
 
   // ----------------------------------------------- segmentSleep (SINGLE SOURCE)
   group('segmentSleep single-source segmentation', () {
+    bool _missingHrAt(
+      int secondInNight,
+      int nightSeconds,
+      int missingPercent,
+      bool continuous,
+      String blockPosition,
+    ) {
+      if (missingPercent == 0) return false;
+      if (!continuous) {
+        // Exactly missingPercent samples in each deterministic 100-s cycle.
+        return secondInNight % 100 < missingPercent;
+      }
+      final missingSeconds = nightSeconds * missingPercent ~/ 100;
+      final firstMissing = switch (blockPosition) {
+        'beginning' => 0,
+        'middle' => (nightSeconds - missingSeconds) ~/ 2,
+        'end' => nightSeconds - missingSeconds,
+        _ => throw ArgumentError.value(blockPosition, 'blockPosition'),
+      };
+      return secondInNight >= firstMissing &&
+          secondInNight < firstMissing + missingSeconds;
+    }
+
     // Build a synthetic capture: [dayHours] active day, then [nightHours] of a
     // still wrist with low sleeping HR, then [tailHours] active again. Movement
     // is injected at the given relative night-seconds (each a brief reorient).
@@ -321,8 +344,15 @@ void main() {
     }
 
     // HR aligned to the accel: daytime ~70, night ~50 (dipped), tail ~70.
-    List<double> _hr(int dayH, int nightH, int tailH,
-        {double sleepingBpm = 50}) {
+    List<double> _hr(
+      int dayH,
+      int nightH,
+      int tailH, {
+      double sleepingBpm = 50,
+      int missingPercent = 0,
+      bool continuousMissing = false,
+      String missingBlockPosition = 'middle',
+    }) {
       // Realistic shape: ~72 bpm awake, a low SMOOTH sleeping HR (~50 bpm with a
       // slow multi-minute drift, NOT a per-second sawtooth). The Walch HR
       // feature is the std of a band-pass-like DoG of HR, so a fast synthetic
@@ -334,12 +364,66 @@ void main() {
       }
       for (var i = 0; i < nightH * 3600; i++) {
         // Low sleeping HR with a gentle ~30-min drift of ±1.5 bpm.
-        hr.add(sleepingBpm + 1.5 * math.sin(i / 1800.0));
+        final bpm = sleepingBpm + 1.5 * math.sin(i / 1800.0);
+        hr.add(
+          _missingHrAt(i, nightH * 3600, missingPercent, continuousMissing,
+                  missingBlockPosition)
+              ? 0
+              : bpm,
+        );
       }
       for (var i = 0; i < tailH * 3600; i++) {
         hr.add(72 + 2 * math.sin(i / 600.0));
       }
       return hr;
+    }
+
+    void _recordMissingness({
+      required String label,
+      required double sleepingBpm,
+      required int missingPercent,
+      String blockPosition = 'middle',
+      required List<double> hr,
+      required List<AccelSample> accel,
+      required SleepSegmentation result,
+      required SleepSegmentation reference,
+    }) {
+      const nightStart = 2 * 3600;
+      const nightSeconds = 7 * 3600;
+      final nightHr = hr.sublist(nightStart, nightStart + nightSeconds);
+      final nightCoverage =
+          nightHr.where((bpm) => bpm > 0).length / nightSeconds;
+      final overallCoverage = hr.where((bpm) => bpm > 0).length / hr.length;
+      final accelCoverage =
+          accel.sublist(nightStart, nightStart + nightSeconds).length /
+          nightSeconds;
+      final stages = <String, int>{};
+      for (final stage in result.stages4) {
+        stages.update(stage, (count) => count + 1, ifAbsent: () => 1);
+      }
+      final window = result.window;
+      final windowText = window == null
+          ? 'absent'
+          : '[${window.onsetIdx}, ${window.offsetIdx})';
+      final startDelta = window == null || reference.window == null
+          ? null
+          : window.onsetIdx - reference.window!.onsetIdx;
+      final endDelta = window == null || reference.window == null
+          ? null
+          : window.offsetIdx - reference.window!.offsetIdx;
+      // ignore: avoid_print
+      print(
+        '$sleepingBpm bpm / $label: intended missing=$missingPercent% '
+        'position=$blockPosition, '
+        'observed night HR=${(100 * nightCoverage).toStringAsFixed(1)}%, '
+        'overall HR=${(100 * overallCoverage).toStringAsFixed(1)}%, '
+        'accel=${(100 * accelCoverage).toStringAsFixed(1)}%, '
+        'source=segmentSleep, present=${result.present}, '
+        'window=$windowText, delta start=$startDelta, end=$endDelta, '
+        'TST=${result.tstSec}, in-bed=${result.inBedSec}, '
+        'unobserved=${result.unobservedSec}, WASO=${result.wasoSec}, '
+        'stages=$stages, absence=${result.absenceReason}',
+      );
     }
 
     test(
@@ -461,6 +545,241 @@ void main() {
       expect(s.inBedSec!, greaterThan(6 * 3600));
       expect(s.inBedSec!, lessThan(8 * 3600));
       expect(s.unobservedSec, 0);
+    });
+
+    const missingnessScenarios = <(String, int, bool)>[
+      ('0% reference', 0, false),
+      ('10% distributed', 10, false),
+      ('10% continuous block', 10, true),
+      ('30% distributed', 30, false),
+      ('30% continuous block', 30, true),
+      ('50% distributed', 50, false),
+      ('50% continuous block', 50, true),
+    ];
+    // These expectations pin current observed outcomes for characterization.
+    // An intentional future algorithm fix may require updating them.
+    for (final sleepingBpm in [50.0, 30.0]) {
+      test('HR missingness characterization: $sleepingBpm bpm night', () {
+        final accel = _accel(2, 7, 1);
+        final baseline = List<double>.filled(60, 70);
+        final referenceHr = _hr(2, 7, 1, sleepingBpm: sleepingBpm);
+        final reference = segmentSleep(
+          accel,
+          referenceHr,
+          hrBaseline: baseline,
+        );
+        expect(reference.present, isTrue, reason: '0% reference night');
+
+        for (final (label, missingPercent, continuous)
+            in missingnessScenarios) {
+          final hr = _hr(
+            2,
+            7,
+            1,
+            sleepingBpm: sleepingBpm,
+            missingPercent: missingPercent,
+            continuousMissing: continuous,
+          );
+          final nightHr = hr.sublist(2 * 3600, 9 * 3600);
+          final result = segmentSleep(accel, hr, hrBaseline: baseline);
+          _recordMissingness(
+            label: label,
+            sleepingBpm: sleepingBpm,
+            missingPercent: missingPercent,
+            hr: hr,
+            accel: accel,
+            result: result,
+            reference: reference,
+          );
+          if (!result.present) {
+            final vanHees = vanHeesSleepWindow(accel);
+            final detectorSessions = AdvancedSleepStager.detectSleep(
+              [
+                for (final sample in accel)
+                  GravTs(sample.tsMs ~/ 1000, sample.x, sample.y, sample.z),
+              ],
+              [
+                for (var i = 0; i < hr.length; i++)
+                  if (hr[i] > 0) HrTs(i, hr[i]),
+              ],
+            );
+            final detectorWindows = detectorSessions
+                .map((session) => '${session.start}-${session.end}')
+                .join(',');
+            // ignore: avoid_print
+            print(
+              'absence diagnostic: van Hees candidate=${vanHees.value != null}, '
+              'AdvancedSleepStager sessions=${detectorSessions.length} '
+              '[$detectorWindows]',
+            );
+          }
+
+          final expectedMissing = 7 * 3600 * missingPercent ~/ 100;
+          expect(
+            nightHr.where((bpm) => bpm == 0).length,
+            expectedMissing,
+            reason: 'the synthetic mask must have the requested exact size',
+          );
+          expect(
+            nightHr.where((bpm) => bpm > 0).length / nightHr.length,
+            closeTo(1 - missingPercent / 100, 1e-12),
+          );
+          expect(hr.length, accel.length);
+          expect(accel.sublist(2 * 3600, 9 * 3600).length / nightHr.length, 1);
+          expect(
+            accel.sublist(2 * 3600, 9 * 3600).length,
+            7 * 3600,
+            reason: 'acceleration remains complete in every scenario',
+          );
+
+          final currentlyDetected = missingPercent != 50 || !continuous;
+          expect(
+            result.present,
+            currentlyDetected,
+            reason: 'current segmentation outcome for $label',
+          );
+          if (currentlyDetected) {
+            expect(result.window, isNotNull);
+            expect(result.tstSec, greaterThan(0));
+            expect(result.inBedSec, greaterThan(0));
+            expect(
+              result.window!.onsetIdx,
+              closeTo(reference.window!.onsetIdx, 15 * 60),
+            );
+            expect(
+              result.window!.offsetIdx,
+              closeTo(reference.window!.offsetIdx, 15 * 60),
+            );
+          } else {
+            expect(result.window, isNull);
+            expect(result.tstSec, isNull);
+            expect(result.inBedSec, isNull);
+            expect(result.stages, isEmpty);
+          }
+        }
+      });
+    }
+
+    test('contiguous HR-gap boundary matches explicit off-wrist spans', () {
+      const percentages = [45, 49, 50, 51];
+      const positions = ['beginning', 'middle', 'end'];
+      const nightStart = 2 * 3600;
+      const nightSeconds = 7 * 3600;
+      final accel = _accel(2, 7, 1);
+      final gravity = [
+        for (final sample in accel)
+          GravTs(sample.tsMs ~/ 1000, sample.x, sample.y, sample.z),
+      ];
+      final fullHr = _hr(2, 7, 1, sleepingBpm: 30);
+      final fullHrRows = [
+        for (var i = 0; i < fullHr.length; i++) HrTs(i, fullHr[i]),
+      ];
+      final baseline = List<double>.filled(60, 70);
+      final reference = segmentSleep(accel, fullHr, hrBaseline: baseline);
+      final referenceSessions = AdvancedSleepStager.detectSleep(
+        gravity,
+        fullHrRows,
+      );
+      expect(reference.present, isTrue);
+      expect(referenceSessions, isNotEmpty);
+      expect(vanHeesSleepWindow(accel).value, isNotNull);
+
+      for (final missingPercent in percentages) {
+        final missingSeconds = nightSeconds * missingPercent ~/ 100;
+        for (final position in positions) {
+          final firstMissing = switch (position) {
+            'beginning' => 0,
+            'middle' => (nightSeconds - missingSeconds) ~/ 2,
+            'end' => nightSeconds - missingSeconds,
+            _ => throw StateError('unreachable block position'),
+          };
+          final hr = _hr(
+            2,
+            7,
+            1,
+            sleepingBpm: 30,
+            missingPercent: missingPercent,
+            continuousMissing: true,
+            missingBlockPosition: position,
+          );
+          final result = segmentSleep(accel, hr, hrBaseline: baseline);
+          final validHrRows = [
+            for (var i = 0; i < hr.length; i++)
+              if (hr[i] > 0) HrTs(i, hr[i]),
+          ];
+          final gapSessions = AdvancedSleepStager.detectSleep(
+            gravity,
+            validHrRows,
+          );
+          final blockStart = nightStart + firstMissing;
+          final blockEnd = blockStart + missingSeconds;
+          final explicitOffWristSpan = switch (position) {
+            'beginning' => [nightStart, blockEnd],
+            'middle' => [blockStart - 1, blockEnd],
+            'end' => [blockStart - 1, nightStart + nightSeconds - 1],
+            _ => throw StateError('unreachable block position'),
+          };
+          final explicitOffWristSessions = AdvancedSleepStager.detectSleep(
+            gravity,
+            fullHrRows,
+            wristOff: [explicitOffWristSpan],
+          );
+          _recordMissingness(
+            label: '$missingPercent% contiguous',
+            sleepingBpm: 30,
+            missingPercent: missingPercent,
+            blockPosition: position,
+            hr: hr,
+            accel: accel,
+            result: result,
+            reference: reference,
+          );
+          // ignore: avoid_print
+          print(
+            'boundary control: missing-HR sessions=${gapSessions.length}, '
+            'explicit wristOff sessions=${explicitOffWristSessions.length}',
+          );
+
+          final expectedRejected = missingPercent > 50 ||
+              (missingPercent == 50 && position != 'end');
+          expect(
+            hr.sublist(nightStart, nightStart + nightSeconds)
+                .where((bpm) => bpm == 0)
+                .length,
+            missingSeconds,
+          );
+          expect(gapSessions.isEmpty, expectedRejected,
+              reason: 'missing-HR gap result at $missingPercent% $position');
+          expect(explicitOffWristSessions.isEmpty, expectedRejected,
+              reason: 'explicit wristOff result at $missingPercent% $position');
+          expect(gapSessions.isEmpty, explicitOffWristSessions.isEmpty,
+              reason: 'a long HR gap and matching wristOff span share the gate');
+          expect(
+            result.present,
+            !expectedRejected,
+            reason:
+                'final segmentSleep outcome at $missingPercent% $position',
+          );
+          if (result.present) {
+            expect(result.window, isNotNull);
+            expect(result.tstSec, greaterThan(0));
+            expect(result.inBedSec, greaterThan(0));
+            expect(
+              result.window!.onsetIdx,
+              closeTo(reference.window!.onsetIdx, 15 * 60),
+            );
+            expect(
+              result.window!.offsetIdx,
+              closeTo(reference.window!.offsetIdx, 15 * 60),
+            );
+          } else {
+            expect(result.window, isNull);
+            expect(result.tstSec, isNull);
+            expect(result.inBedSec, isNull);
+            expect(result.stages, isEmpty);
+          }
+        }
+      }
     });
 
     test('(b) brief mid-night movements do NOT fragment the window', () {
