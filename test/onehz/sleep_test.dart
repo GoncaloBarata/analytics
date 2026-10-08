@@ -321,7 +321,8 @@ void main() {
     }
 
     // HR aligned to the accel: daytime ~70, night ~50 (dipped), tail ~70.
-    List<double> _hr(int dayH, int nightH, int tailH) {
+    List<double> _hr(int dayH, int nightH, int tailH,
+        {double sleepingBpm = 50}) {
       // Realistic shape: ~72 bpm awake, a low SMOOTH sleeping HR (~50 bpm with a
       // slow multi-minute drift, NOT a per-second sawtooth). The Walch HR
       // feature is the std of a band-pass-like DoG of HR, so a fast synthetic
@@ -333,7 +334,7 @@ void main() {
       }
       for (var i = 0; i < nightH * 3600; i++) {
         // Low sleeping HR with a gentle ~30-min drift of ±1.5 bpm.
-        hr.add(50 + 1.5 * math.sin(i / 1800.0));
+        hr.add(sleepingBpm + 1.5 * math.sin(i / 1800.0));
       }
       for (var i = 0; i < tailH * 3600; i++) {
         hr.add(72 + 2 * math.sin(i / 600.0));
@@ -443,6 +444,23 @@ void main() {
       expect(j['light_sec'], s.lightSec);
       expect(j['deep_sec'], s.deepSec);
       expect(j['deep_low_confidence'], isTrue);
+    });
+
+    test('(a2) valid 25-35 bpm sleeping HR remains usable for a full night', () {
+      final accel = _accel(2, 7, 1);
+      final hr = _hr(2, 7, 1, sleepingBpm: 30);
+      final nightHr = hr.sublist(2 * 3600, 9 * 3600);
+      expect(nightHr.every((bpm) => bpm >= 25 && bpm <= 35), isTrue);
+
+      final s = segmentSleep(accel, hr);
+
+      expect(s.present, isTrue);
+      expect(s.window, isNotNull);
+      expect(s.window!.onsetIdx, closeTo(2 * 3600, 15 * 60));
+      expect(s.window!.offsetIdx, closeTo(9 * 3600, 15 * 60));
+      expect(s.inBedSec!, greaterThan(6 * 3600));
+      expect(s.inBedSec!, lessThan(8 * 3600));
+      expect(s.unobservedSec, 0);
     });
 
     test('(b) brief mid-night movements do NOT fragment the window', () {
