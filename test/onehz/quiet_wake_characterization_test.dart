@@ -14,6 +14,18 @@ final _captureStartSec =
 
 enum _Signal { ordinary, quiet, clear }
 
+enum _MovementProfile { sleepLike, wakeLike, mild }
+
+enum _HrProfile { sleepLike, wakeLike, moderate }
+
+enum _ArousalSignal { movementOnly, hrOnly, both }
+
+typedef _ArousalEvent = ({
+  int startOffsetSec,
+  int durationSec,
+  _ArousalSignal signal,
+});
+
 typedef _Fixture = ({
   List<AccelSample> accel,
   List<double> hr,
@@ -27,10 +39,28 @@ _Fixture _build({
   required String caseName,
   required int awakeInBedMinutes,
   required _Signal signal,
+  _MovementProfile? movementProfile,
+  _HrProfile? hrProfile,
+  List<_ArousalEvent> arousals = const [],
   bool continuedSleepTruth = false,
 }) {
+  final movement =
+      movementProfile ??
+      switch (signal) {
+        _Signal.ordinary => _MovementProfile.sleepLike,
+        _Signal.quiet => _MovementProfile.sleepLike,
+        _Signal.clear => _MovementProfile.wakeLike,
+      };
+  final heartRate =
+      hrProfile ??
+      switch (signal) {
+        _Signal.ordinary => _HrProfile.sleepLike,
+        _Signal.quiet => _HrProfile.sleepLike,
+        _Signal.clear => _HrProfile.wakeLike,
+      };
   final wakeSec = _captureStartSec + _finalWakeIndex;
   final leaveBedSec = wakeSec + awakeInBedMinutes * 60;
+  final leaveBedIndex = _finalWakeIndex + awakeInBedMinutes * 60;
   final confirmedWakeSec = continuedSleepTruth ? leaveBedSec : wakeSec;
   final accel = <AccelSample>[];
   final hr = <double>[];
@@ -39,35 +69,67 @@ _Fixture _build({
     final t = _captureStartSec + i;
     final beforeSleep = i < _sleepOnsetIndex;
     final asleepBySignal = i >= _sleepOnsetIndex && i < _finalWakeIndex;
-    final inPostWakeInterval =
-        i >= _finalWakeIndex && i < _finalWakeIndex + awakeInBedMinutes * 60;
-    final sleepingLike =
-        asleepBySignal || (inPostWakeInterval && signal == _Signal.quiet);
-    final clearlyAwake =
-        (inPostWakeInterval && signal == _Signal.clear) ||
-        i >= _finalWakeIndex + awakeInBedMinutes * 60;
+    final inPostWakeInterval = i >= _finalWakeIndex && i < leaveBedIndex;
+    final afterLeaveBed = i >= leaveBedIndex;
+    _ArousalEvent? activeArousal;
+    for (final arousal in arousals) {
+      if (i >= arousal.startOffsetSec &&
+          i < arousal.startOffsetSec + arousal.durationSec) {
+        activeArousal = arousal;
+        break;
+      }
+    }
+    final arousalMoves =
+        activeArousal != null &&
+        (activeArousal.signal == _ArousalSignal.movementOnly ||
+            activeArousal.signal == _ArousalSignal.both);
+    final arousalRaisesHr =
+        activeArousal != null &&
+        (activeArousal.signal == _ArousalSignal.hrOnly ||
+            activeArousal.signal == _ArousalSignal.both);
 
-    final bpm = beforeSleep
-        ? 74 + 2 * math.sin(i / 90.0)
-        : (sleepingLike
-              ? (i < _finalWakeIndex ? 52 : 57) + 1.5 * math.sin(i / 1800.0)
-              : (clearlyAwake ? 86 : 72) + 2 * math.sin(i / 120.0));
+    final double bpm;
+    if (beforeSleep) {
+      bpm = 74 + 2 * math.sin(i / 90.0);
+    } else if (arousalRaisesHr) {
+      bpm = 82 + 2 * math.sin(i / 120.0);
+    } else if (afterLeaveBed ||
+        (inPostWakeInterval && heartRate == _HrProfile.wakeLike)) {
+      bpm = 86 + 2 * math.sin(i / 120.0);
+    } else if (inPostWakeInterval && heartRate == _HrProfile.moderate) {
+      bpm = 69 + 1.5 * math.sin(i / 1800.0);
+    } else if (inPostWakeInterval && heartRate == _HrProfile.sleepLike) {
+      bpm = 57 + 1.5 * math.sin(i / 1800.0);
+    } else {
+      bpm = (asleepBySignal ? 52 : 57) + 1.5 * math.sin(i / 1800.0);
+    }
 
     var ax = 0.02;
     var ay = 0.02;
     var az = 1.0;
-    if (beforeSleep || clearlyAwake) {
+    if (beforeSleep ||
+        afterLeaveBed ||
+        (inPostWakeInterval && movement == _MovementProfile.wakeLike) ||
+        arousalMoves) {
       final phase = math.sin(i * 0.5);
       ax = 0.3 * phase;
       ay = 0.3;
       az = 0.9 * (1 - 0.2 * phase);
-    } else if (inPostWakeInterval && signal == _Signal.quiet) {
-      // A short, low-amplitude wrist adjustment every 15 minutes. HR remains
-      // sleep-like. This is movement only; phone use is not a sensor input.
+    } else if (inPostWakeInterval && movement == _MovementProfile.sleepLike) {
+      // Preserve the Phase 3B2 quiet profile: a tiny wrist adjustment every
+      // 15 minutes, independent of the HR profile.
       final pulseSecond = (i - _finalWakeIndex) % 900;
       if (pulseSecond < 5) {
         ax = 0.02 + 0.025 * math.sin(pulseSecond * math.pi / 4);
         ay = 0.02;
+        az = math.sqrt(1 - ax * ax - ay * ay);
+      }
+    } else if (inPostWakeInterval && movement == _MovementProfile.mild) {
+      // A modest 10-second adjustment every three minutes.
+      final pulseSecond = (i - _finalWakeIndex) % 180;
+      if (pulseSecond < 10) {
+        ax = 0.02 + 0.08 * math.sin(pulseSecond * math.pi / 5);
+        ay = 0.04;
         az = math.sqrt(1 - ax * ax - ay * ay);
       }
     }
@@ -231,6 +293,155 @@ List<int> _gen5BandEnvelope(_Fixture fixture) => [
       0,
 ];
 
+typedef _Observation = ({
+  SleepSegmentation segmented,
+  List<SleepSession> sessions,
+  SleepSession fixedWindowStages,
+  Map<String, int> awakeStageSeconds,
+});
+
+_Observation _observe(_Fixture fixture) {
+  final segmented = _segment(fixture);
+  final sessions = _detect(fixture);
+  final fixedWindowStages = AdvancedSleepStager.stageWindow(
+    _captureStartSec + _sleepOnsetIndex,
+    _captureStartSec + 10 * 60 * 60,
+    _gravity(fixture),
+    _heartRate(fixture),
+  );
+  final awakeStageSeconds = _sessionStageOverlap(
+    fixedWindowStages,
+    fixture.confirmedWakeSec,
+    fixture.leaveBedSec,
+  );
+  return (
+    segmented: segmented,
+    sessions: sessions,
+    fixedWindowStages: fixedWindowStages,
+    awakeStageSeconds: awakeStageSeconds,
+  );
+}
+
+bool _sameMotion(List<AccelSample> a, List<AccelSample> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    final left = a[i];
+    final right = b[i];
+    if (left.tsMs != right.tsMs ||
+        left.x != right.x ||
+        left.y != right.y ||
+        left.z != right.z ||
+        left.valid != right.valid) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool _sameHeartRate(List<double> a, List<double> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+bool _samePreAwakeningMotion(List<AccelSample> a, List<AccelSample> b) {
+  if (a.length != b.length || a.length < _finalWakeIndex) return false;
+  for (var i = 0; i < _finalWakeIndex; i++) {
+    final left = a[i];
+    final right = b[i];
+    if (left.tsMs != right.tsMs ||
+        left.x != right.x ||
+        left.y != right.y ||
+        left.z != right.z ||
+        left.valid != right.valid) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool _samePreAwakeningHeartRate(List<double> a, List<double> b) {
+  if (a.length != b.length || a.length < _finalWakeIndex) return false;
+  for (var i = 0; i < _finalWakeIndex; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+String _outcome(
+  SleepSegmentation result,
+  List<SleepSession> sessions,
+  int wake,
+) {
+  final window = result.window;
+  if (window == null) return 'rejected';
+  if (sessions.length > 1) return 'split(${sessions.length})';
+  final offset = window.offsetMs?.toInt() ?? 0;
+  if (offset < wake * 1000) return 'truncated-before-wake';
+  return 'single-window';
+}
+
+String _durationMinutes(int? seconds) =>
+    seconds == null ? 'n/a' : '${(seconds / 60).toStringAsFixed(1)}m';
+
+void _printPrimaryResult(_Fixture fixture, _Observation observed) {
+  final result = observed.segmented;
+  final onset = result.window?.onsetMs?.toInt();
+  final offset = result.window?.offsetMs?.toInt();
+  final durationSec = onset == null || offset == null
+      ? null
+      : (offset - onset) ~/ 1000;
+  final offsetError = offset == null
+      ? 'n/a'
+      : '${((offset ~/ 1000 - fixture.confirmedWakeSec) / 60).toStringAsFixed(1)}m';
+  final awakeEpochs = observed.awakeStageSeconds['wake'] ?? 0;
+  // ignore: avoid_print
+  print(
+    '3B3 ${fixture.caseName}: true-wake=${_localTime(fixture.confirmedWakeSec)}, '
+    'offset=${offset == null ? 'absent' : _localTime(offset ~/ 1000)}, '
+    'signed-error=${offsetError}, '
+    'detected-window=${_durationMinutes(durationSec)}, '
+    'in-bed=${result.inBedSec}s, TST=${result.tstSec}s, '
+    'WASO=${result.wasoSec}s, unobserved=${result.unobservedSec}s, '
+    'auto-segment-stages=${_segmentStages(result)}, '
+    'fixed-window-wake-epochs=${awakeEpochs}s/'
+    '${fixture.trueAwakeInBedMinutes * 60}s, '
+    'window-outcome=${_outcome(result, observed.sessions, fixture.confirmedWakeSec)}, '
+    'detector-sessions=${observed.sessions.length}',
+  );
+}
+
+void _printArousalResult(
+  _Fixture fixture,
+  _Observation observed,
+  _ArousalEvent arousal,
+) {
+  final result = observed.segmented;
+  final eventStart = _captureStartSec + arousal.startOffsetSec;
+  final eventEnd = eventStart + arousal.durationSec;
+  final eventStages = _sessionStageOverlap(
+    observed.fixedWindowStages,
+    eventStart,
+    eventEnd,
+  );
+  final offset = result.window?.offsetMs?.toInt();
+  // ignore: avoid_print
+  print(
+    '3B3 AROUSAL ${fixture.caseName}: event='
+    '[${_localTime(eventStart)}, ${_localTime(eventEnd)}), '
+    'true-wake=${_localTime(fixture.confirmedWakeSec)}, '
+    'offset=${offset == null ? 'absent' : _localTime(offset ~/ 1000)}, '
+    'in-bed=${result.inBedSec}s, TST=${result.tstSec}s, '
+    'WASO=${result.wasoSec}s, unobserved=${result.unobservedSec}s, '
+    'auto-segment-stages=${_segmentStages(result)}, '
+    'event-stages=${eventStages}, detector-sessions=${observed.sessions.length}, '
+    'window-outcome='
+    '${_outcome(result, observed.sessions, fixture.confirmedWakeSec)}',
+  );
+}
+
 void main() {
   test('ordinary, quiet and clear waking characterize the sleep window', () {
     final control = _build(
@@ -338,6 +549,186 @@ void main() {
     }
   });
 
+  test('3B3 isolates motion and HR across all 15 wake profiles', () {
+    const profiles =
+        <
+          ({
+            String id,
+            String name,
+            _MovementProfile movement,
+            _HrProfile heartRate,
+          })
+        >[
+          (
+            id: 'A',
+            name: 'A sleep-like motion + sleep-like HR',
+            movement: _MovementProfile.sleepLike,
+            heartRate: _HrProfile.sleepLike,
+          ),
+          (
+            id: 'B',
+            name: 'B wake-like motion + sleep-like HR',
+            movement: _MovementProfile.wakeLike,
+            heartRate: _HrProfile.sleepLike,
+          ),
+          (
+            id: 'C',
+            name: 'C sleep-like motion + wake-like HR',
+            movement: _MovementProfile.sleepLike,
+            heartRate: _HrProfile.wakeLike,
+          ),
+          (
+            id: 'D',
+            name: 'D wake-like motion + wake-like HR',
+            movement: _MovementProfile.wakeLike,
+            heartRate: _HrProfile.wakeLike,
+          ),
+          (
+            id: 'E',
+            name: 'E mild motion + moderate HR increase',
+            movement: _MovementProfile.mild,
+            heartRate: _HrProfile.moderate,
+          ),
+        ];
+
+    for (final minutes in [30, 60, 90]) {
+      final byProfile = <String, _Fixture>{};
+      for (final profile in profiles) {
+        final fixture = _build(
+          caseName: '${profile.name}, awake-in-bed=${minutes}m',
+          awakeInBedMinutes: minutes,
+          signal: _Signal.quiet,
+          movementProfile: profile.movement,
+          hrProfile: profile.heartRate,
+        );
+        byProfile[profile.id] = fixture;
+
+        expect(fixture.accel, hasLength(_captureSeconds));
+        expect(fixture.hr, hasLength(_captureSeconds));
+        expect(fixture.accel.every((sample) => sample.valid), isTrue);
+        expect(
+          fixture.accel.every(
+            (sample) =>
+                sample.x.abs() <= 1.2 &&
+                sample.y.abs() <= 1.2 &&
+                sample.z.abs() <= 1.2,
+          ),
+          isTrue,
+        );
+        expect(
+          fixture.hr.every((bpm) => bpm.isFinite && bpm > 0 && bpm < 200),
+          isTrue,
+        );
+        expect(fixture.confirmedWakeSec, _captureStartSec + _finalWakeIndex);
+        expect(
+          fixture.leaveBedSec,
+          _captureStartSec + _finalWakeIndex + minutes * 60,
+        );
+
+        final baseline = byProfile['A'];
+        if (baseline != null) {
+          expect(
+            _samePreAwakeningMotion(fixture.accel, baseline.accel),
+            isTrue,
+            reason: '${profile.id} must share pre-awakening motion with A',
+          );
+          expect(
+            _samePreAwakeningHeartRate(fixture.hr, baseline.hr),
+            isTrue,
+            reason: '${profile.id} must share pre-awakening HR with A',
+          );
+          switch (profile.id) {
+            case 'B':
+              expect(_sameHeartRate(fixture.hr, baseline.hr), isTrue);
+              expect(_sameMotion(fixture.accel, baseline.accel), isFalse);
+            case 'C':
+              expect(_sameMotion(fixture.accel, baseline.accel), isTrue);
+              expect(_sameHeartRate(fixture.hr, baseline.hr), isFalse);
+            case 'D':
+              final wakeMotion = byProfile['B']!;
+              final wakeHeartRate = byProfile['C']!;
+              expect(_sameMotion(fixture.accel, wakeMotion.accel), isTrue);
+              expect(_sameHeartRate(fixture.hr, wakeHeartRate.hr), isTrue);
+            case 'E':
+              expect(profile.movement, _MovementProfile.mild);
+              expect(profile.heartRate, _HrProfile.moderate);
+          }
+        }
+        final observed = _observe(fixture);
+        final expectedWindowPresent = profile.id != 'C' || minutes == 30;
+        expect(observed.segmented.present, expectedWindowPresent);
+        expect(
+          observed.sessions,
+          expectedWindowPresent ? hasLength(1) : isEmpty,
+        );
+        if (expectedWindowPresent) {
+          final offsetMs = observed.segmented.window!.offsetMs!.toInt();
+          final movementProfileEndsEarly =
+              profile.id == 'B' || profile.id == 'D';
+          expect(
+            offsetMs < fixture.confirmedWakeSec * 1000,
+            movementProfileEndsEarly,
+          );
+          expect(observed.awakeStageSeconds['wake'] ?? 0, 0);
+        }
+        if (profile.id == 'E' && minutes == 60) {
+          expect(observed.segmented.wasoSec, greaterThan(0));
+        }
+        if (profile.id == 'E' && minutes == 90) {
+          expect(observed.segmented.wasoSec, 0);
+        }
+        _printPrimaryResult(fixture, observed);
+      }
+    }
+  });
+
+  test(
+    '3B3 reports movement-only, HR-only and combined nighttime arousals',
+    () {
+      const signals = <({String name, _ArousalSignal signal})>[
+        (name: 'movement-only', signal: _ArousalSignal.movementOnly),
+        (name: 'HR-only', signal: _ArousalSignal.hrOnly),
+        (name: 'movement+HR', signal: _ArousalSignal.both),
+      ];
+
+      for (final durationSec in [30, 120, 300]) {
+        for (final profile in signals) {
+          final arousal = (
+            startOffsetSec: 4 * 60 * 60, // 02:00 Lisbon, during the night
+            durationSec: durationSec,
+            signal: profile.signal,
+          );
+          final fixture = _build(
+            caseName: '${profile.name}, duration=${durationSec}s',
+            awakeInBedMinutes: 30,
+            signal: _Signal.clear,
+            movementProfile: _MovementProfile.wakeLike,
+            hrProfile: _HrProfile.wakeLike,
+            arousals: [arousal],
+          );
+          expect(fixture.accel, hasLength(_captureSeconds));
+          expect(fixture.hr, hasLength(_captureSeconds));
+          expect(fixture.accel.every((sample) => sample.valid), isTrue);
+          expect(fixture.hr.every((bpm) => bpm > 0), isTrue);
+          final observed = _observe(fixture);
+          expect(observed.segmented.present, isTrue);
+          expect(observed.sessions, hasLength(1));
+          expect(
+            observed.segmented.window!.offsetMs!.toInt(),
+            lessThan(fixture.confirmedWakeSec * 1000),
+          );
+          if (durationSec == 300) {
+            if (profile.signal == _ArousalSignal.movementOnly) {
+              expect(observed.segmented.wasoSec, 0);
+            } else {
+              expect(observed.segmented.wasoSec, greaterThan(0));
+            }
+          }
+          _printArousalResult(fixture, observed, arousal);
+        }
+      }
+    },
+  );
   test('synthetic Gen5/MG band envelope versus sensor-only path', () {
     for (final minutes in [30, 60, 90]) {
       final fixture = _build(
